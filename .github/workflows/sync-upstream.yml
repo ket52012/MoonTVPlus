@@ -1,6 +1,4 @@
-# 每周自动把 fork 同步到上游默认分支
-# 用法: 把此文件放进每个 fork 的 .github/workflows/sync-upstream.yml (默认分支)
-# 推送只需要一次, 之后每周靠仓库自带的 GITHUB_TOKEN 自动跑, 不再需要 PAT
+# 每周自动把 fork 同步到上游默认分支, 合入新代码后自动触发 Cloudflare 部署
 name: 每周同步上游
 
 on:
@@ -11,16 +9,20 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
       - name: 合并上游默认分支
+        id: merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH=$(gh api "repos/${{ github.repository }}" --jq .default_branch)
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          BEFORE=$(gh api "repos/${{ github.repository }}/branches/$BRANCH" --jq .commit.sha)
           set +e
           OUT=$(gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch="$BRANCH" 2>&1)
           CODE=$?
@@ -29,4 +31,24 @@ jobs:
           # 已是最新时 GitHub 可能返回非 0, 视为成功; 真正的冲突/失败才报错
           if [ $CODE -ne 0 ] && ! echo "$OUT" | grep -qiE "already up to date|nothing to merge"; then
             exit $CODE
+          fi
+          AFTER=$(gh api "repos/${{ github.repository }}/branches/$BRANCH" --jq .commit.sha)
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "merged=true" >> $GITHUB_OUTPUT
+            echo "有新提交合入: $BEFORE -> $AFTER"
+          else
+            echo "merged=false" >> $GITHUB_OUTPUT
+            echo "已是最新, 无需部署"
+          fi
+
+      - name: 有更新时触发 Cloudflare 部署
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh workflow list --json name --jq '.[].name' | grep -qx "Deploy to Cloudflare"; then
+            gh workflow run "Deploy to Cloudflare" --ref "${{ steps.merge.outputs.branch }}"
+            echo "已触发 Cloudflare 部署"
+          else
+            echo "未找到 Deploy to Cloudflare 工作流, 跳过"
           fi
